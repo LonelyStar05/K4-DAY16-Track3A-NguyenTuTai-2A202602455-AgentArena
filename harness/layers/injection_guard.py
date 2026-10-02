@@ -47,6 +47,9 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
@@ -69,10 +72,76 @@ class InjectionGuard(Middleware):
         #     cắt từ BLOCK_START tới hết chuỗi.
         #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
         #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if result is None or not hasattr(result, "ok"):
+            return result
+        content = result.content if isinstance(result.content, str) else ""
+        error = result.error if isinstance(getattr(result, "error", None), str) else ""
+        clean, removed = _quarantine(content)
+        clean_err, removed_err = _quarantine(error)
+        if not removed and not removed_err:
+            return result
+        ctx.state["injection_blocks"] = ctx.state.get("injection_blocks", 0) + removed + removed_err
+        return ToolResult(
+            ok=result.ok, content=clean, error=clean_err if removed_err else result.error
+        )
 
     def after_agent(self, ctx, report):
         # TODO (§10): 2-4 dòng.
         #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
         #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        if not isinstance(report, dict):
+            return report
+        answer = report.get("answer")
+        if isinstance(answer, str) and INJECTION_CANARY in answer:
+            report["answer"] = " ".join(answer.replace(INJECTION_CANARY, "").split())
+        # Scorer tìm canary ở BẤT KỲ ĐÂU trong report. Claim thì không được
+        # sửa chữ — nên claim nào mang canary bị XOÁ hẳn (xoá là hợp lệ).
+        claims = report.get("claims")
+        if isinstance(claims, list):
+            kept = [c for c in claims if INJECTION_CANARY not in _flat(c)]
+            if len(kept) != len(claims):
+                report["claims"] = kept
+                report["citations"] = sorted(
+                    {c["doc_id"] for c in kept if isinstance(c, dict) and isinstance(c.get("doc_id"), str)}
+                )
+        for key, value in list(report.items()):
+            if key in ("answer", "claims"):
+                continue
+            if isinstance(value, str) and INJECTION_CANARY in value:
+                report[key] = " ".join(value.replace(INJECTION_CANARY, "").split())
+            elif isinstance(value, list) and INJECTION_CANARY in _flat(value):
+                report[key] = [v for v in value if INJECTION_CANARY not in _flat(v)]
+        return report
+
+
+def _quarantine(text: str) -> tuple[str, int]:
+    """Thay mọi khối BLOCK_START..BLOCK_END bằng PLACEHOLDER.
+
+    Thiếu dấu mốc đóng (fetch bị cắt) -> cắt tới hết chuỗi. Chuỗi canary
+    lẻ loi ngoài khối cũng bị gỡ: canary chỉ cần nằm trong message là đủ
+    để mô hình dính bẫy.
+    """
+    if not text:
+        return text, 0
+    removed = 0
+    while BLOCK_START in text:
+        start = text.index(BLOCK_START)
+        end = text.find(BLOCK_END, start)
+        tail = "" if end == -1 else text[end + len(BLOCK_END):]
+        text = text[:start] + PLACEHOLDER + tail
+        removed += 1
+    if INJECTION_CANARY in text:
+        text = text.replace(INJECTION_CANARY, PLACEHOLDER)
+        removed += 1
+    return text, removed
+
+
+def _flat(value) -> str:
+    """Mọi chuỗi bên trong một giá trị JSON, nối lại — để dò canary."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(_flat(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return " ".join(_flat(v) for v in value)
+    return ""

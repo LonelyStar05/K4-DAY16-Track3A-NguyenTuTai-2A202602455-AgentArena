@@ -59,6 +59,14 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._grounding import (
+    citations_of,
+    claim_doc,
+    claim_text,
+    observed_docs,
+    quotes,
+    source_for,
+)
 from harness.middleware import Middleware
 
 
@@ -80,4 +88,25 @@ class CitationChecker(Middleware):
         #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
         #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
         #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims") if isinstance(report, dict) else None
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+        observed_ids = {d.doc_id for d in observed_docs(ctx)}
+        moved = 0
+        for claim in claims:
+            text = claim_text(claim)
+            if not text:
+                continue
+            cited = claim_doc(claim)
+            # Đúng tài liệu VÀ tài liệu đó đã được đọc -> giữ nguyên.
+            if cited in observed_ids and quotes(ctx, ctx.corpus.get(cited), text):
+                continue
+            source = source_for(ctx, text, prefer=cited)
+            if source is None:
+                continue  # không có trong bằng chứng -> việc của critic
+            if source.doc_id != cited:
+                claim["doc_id"] = source.doc_id  # chỉ đổi citation, KHÔNG đổi chữ
+                moved += 1
+        ctx.state["citations_moved"] = ctx.state.get("citations_moved", 0) + moved
+        report["citations"] = citations_of(claims)
+        return report

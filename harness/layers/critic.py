@@ -70,7 +70,36 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._grounding import (
+    MIN_QUOTE_CHARS,
+    citations_of,
+    claim_doc,
+    claim_text,
+    norm,
+    source_for,
+)
 from harness.middleware import Middleware
+
+#: Chỗ "dán" mà mô hình dùng để ghép hai nửa câu của hai nguồn. " và " là
+#: chữ ký đã đo; các liên từ/dấu còn lại để đỡ mô hình thật.
+SPLIT_SEPARATORS = (" và ", "; ", ", nhưng ", " nhưng ", ", còn ", " còn ", ", ")
+
+#: Ngưỡng của scorer (MAX_CLAIMS_PER_DOC, MAX_SCORED_CLAIMS, MAX_CLAIM_CHARS).
+MAX_PER_DOC = 4
+MAX_CLAIMS = 10
+MAX_CHARS = 480
+
+#: Ký tự được phép CẮT ở hai đầu một nửa câu (cắt = substring, hợp lệ).
+_EDGE = " \t\n,;:.-–—"
+
+ABSTAIN_ANSWER = (
+    "Không đủ căn cứ: các tài liệu đã truy xuất không chứa bằng chứng "
+    "nguyên văn cho câu trả lời, nên tôi không đưa ra kết luận."
+)
+CONFLICT_NOTE = (
+    " (Lưu ý: các nguồn đã truy xuất mâu thuẫn nhau; đã nêu cả hai phía "
+    "và không tự chọn một kết luận.)"
+)
 
 
 class Critic(Middleware):
@@ -91,4 +120,71 @@ class Critic(Middleware):
         #     claims = [], citations = [], và viết lại "answer" nói rõ là
         #     không đủ căn cứ.
         #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        claims = claims if isinstance(claims, list) else []
+        kept, seen, per_doc = [], set(), {}
+        dropped = split = 0
+        conflict = False
+
+        def keep(text, doc_id):
+            key = norm(text)
+            if key in seen or per_doc.get(doc_id, 0) >= MAX_PER_DOC or len(kept) >= MAX_CLAIMS:
+                return
+            seen.add(key)
+            per_doc[doc_id] = per_doc.get(doc_id, 0) + 1
+            kept.append({"text": text, "doc_id": doc_id})
+
+        for claim in claims:
+            text = claim_text(claim)
+            if len(text) > MAX_CHARS:
+                text = text[:MAX_CHARS]  # CẮT là hợp lệ, sửa thì không
+            source = source_for(ctx, text, prefer=claim_doc(claim)) if text else None
+            if source is not None:
+                # Có trong bằng chứng -> GIỮ, với citation như đang có. Gắn
+                # lại citation sai là việc của `citation_checker` (§11).
+                keep(text, claim_doc(claim) or source.doc_id)
+                continue
+            halves = self._split(ctx, text)
+            if halves:
+                split += 1
+                for half, doc in halves:
+                    keep(half, doc.doc_id)
+                conflict = conflict or halves[0][1].doc_id != halves[1][1].doc_id
+                continue
+            dropped += 1  # không bằng chứng nào đỡ -> bịa -> xoá
+
+        report["claims"] = kept
+        report["citations"] = citations_of(kept)
+        if conflict:
+            report["abstain"] = True
+            answer = report.get("answer")
+            report["answer"] = (answer if isinstance(answer, str) else "").strip() + CONFLICT_NOTE
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = ABSTAIN_ANSWER
+        ctx.state["critic"] = f"kept={len(kept)} dropped={dropped} split={split}"
+        return report
+
+    @staticmethod
+    def _split(ctx, text):
+        """Tách một câu ghép tại chỗ dán: hai nửa đều phải là trích dẫn
+        nguyên văn của tài liệu đã quan sát. Trả về [(nửa, doc), (nửa, doc)]
+        hoặc None. Mỗi nửa là SUBSTRING của chữ mô hình — chỉ cắt, không sửa."""
+        if not text:
+            return None
+        for sep in SPLIT_SEPARATORS:
+            start = text.find(sep)
+            while start != -1:
+                left = text[:start].strip(_EDGE)
+                right = text[start + len(sep):].strip(_EDGE)
+                if len(norm(left)) >= MIN_QUOTE_CHARS and len(norm(right)) >= MIN_QUOTE_CHARS:
+                    left_doc = source_for(ctx, left)
+                    right_doc = source_for(ctx, right)
+                    if left_doc is not None and right_doc is not None:
+                        return [(left, left_doc), (right, right_doc)]
+                start = text.find(sep, start + 1)
+        return None
